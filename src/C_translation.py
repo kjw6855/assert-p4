@@ -3,6 +3,7 @@ import uuid
 from difflib import SequenceMatcher
 # from helper import eprint
 
+hasMarkToDrop = False
 headers = []
 structFieldsHeaderTypes = {} #structField, structFieldType
 structs = {} # structName, listOfFields
@@ -15,7 +16,7 @@ tableIDs = {} #tableName, nodeID
 declarationTypes = {} #instanceName, instanceType
 forwardDeclarations = []
 package = ""
-currentTable = "" 
+currentTable = ""
 forwardingRules = {}
 currentTableKeys = {} #keyName, (exact, lpm or ternary)
 currentTableKeysOrdered = []
@@ -24,13 +25,15 @@ globalDeclarations = ""
 assertionsCount = 0 #tracking id for klee_print_once
 finalAssertions = """void assert_error(int id, char msg[]) {
 \tklee_print_once(id, msg);
-\t//klee_abort();
+\tklee_abort();
 }
 
 void end_assertions() {
 """
 emitHeadersAssertions = []
 extractHeadersAssertions = []
+parserErrors = ["NoError", "PacketTooShort", "NoMatch", "StackOutOfBounds", "HeaderTooShort",
+             "ParserTimeout", "ParserInvalidArgument"]
 
 # cleanup global variables for run() reusability in the same program...
 def cleanup_variables():
@@ -59,7 +62,7 @@ def cleanup_variables():
     global package
     package = ""
     global currentTable
-    currentTable = "" 
+    currentTable = ""
     global forwardingRules
     forwardingRules = None
     global currentTableKeys
@@ -105,19 +108,33 @@ def remove_unecessary_extract_aux_vars(lines):
 def post_processing(model_string):
     return remove_unecessary_extract_aux_vars(model_string.split("\n"))
 
+def print_parser_error_enum():
+    global parserErrors
+    returnString = ""
+    returnString += "enum ParserError {\n"
+    for parserError in parserErrors:
+        returnString += "\t" + parserError + ",\n"
+
+    returnString += "};\n\n"
+    return returnString
+
+
 def run(node, rules):
     cleanup_variables()
     if rules != None:
         global forwardingRules
         forwardingRules = rules
     returnString = "#define BITSLICE(x, a, b) ((x) >> (b)) & ((1 << ((a)-(b)+1)) - 1)\n#include<stdio.h>\n#include<stdint.h>\n#include<stdlib.h>\n\nint assert_forward = 1;\nint action_run;\n\nvoid end_assertions();\n\n"
+
+    returnString += print_parser_error_enum()
+
     program = toC(node)
     returnString += globalDeclarations
     for declaration in forwardDeclarations:
         returnString += "\nvoid " + declaration[0] + "(" + declaration[1] + ");"
     returnString += "\n\n" + program + finalAssertions + "}\n\n"
     return returnString
-    
+
 
 def toC(node):
     # test for annotations
@@ -131,13 +148,15 @@ def toC(node):
             if nodeString != "":
                 returnString += nodeString + "\n"
     else:
+        print node.Node_Type, node.Node_ID
+
         returnString += globals()[node.Node_Type](node) #calls corresponding type function according to node type
     return returnString
 
 ########### TYPE FUNCTIONS ###########
 
 def P4Program(node):
-    return toC(node.declarations)
+    return toC(node.objects)
 
 def P4Control(node):
     returnString = "//Control\n"
@@ -163,7 +182,7 @@ def P4Control(node):
     return returnString
 
 def Cmpl(node):
-    return "~" + toC(node.expr) 
+    return "~" + toC(node.expr)
 
 def BlockStatement(node):
     returnString = ""
@@ -221,7 +240,7 @@ def ActionList(node):
         return ""
 
 def ActionListElement(node):
-    #return "<ActionListElement>" + str(node.Node_ID) 
+    #return "<ActionListElement>" + str(node.Node_ID)
     return ""
 
 def Add(node):
@@ -231,15 +250,16 @@ def Sub(node):
     return sub(node)
 
 def Annotation(node):
-    #return "<Annotation>" + str(node.Node_ID) 
+    #return "<Annotation>" + str(node.Node_ID)
     return ""
 
 def Annotations(node):
     returnString = ""
     for annotation in node.annotations.vec:
         if annotation.name == "assert":
-            assert_string = annotation.expr.vec[0].value
-            assertionResults = assertion(assert_string, annotation.expr.vec[0].Node_ID)
+            # assert_string = annotation.expr.vec[0].value
+            assert_string = annotation.body.vec[0].text
+            assertionResults = assertion(assert_string, annotation.body.vec[0].Node_ID)
             returnString += assertionResults[0]
             #if assert_string[1] != "":
             #    message = assert_string[1] + "\\n"
@@ -337,6 +357,9 @@ def assertion(assertionString, nodeID):
 def ArrayIndex(node):
     return toC(node.left) + "[" + str(node.right.value) + "]"
 
+def Argument(node):
+    return toC(node.expression)
+
 def AssignmentStatement(node):
     if isExternal(node.right):
         symValue = toC(node.left)
@@ -354,16 +377,30 @@ def Constant(node):
 
 def ConstructorCallExpression(node):
     #return "<ConstructorCallExpression>" + str(node.Node_ID)
-    return "" 
+    return ""
+
+def Declaration_Constant(node):
+    returnString = ""
+    if node.type.Node_Type == "Type_Bits":
+        returnString = bitsSizeToType(node.type.size) + " " + node.name + "="
+    elif node.type.Node_Type == "Type_Boolean":
+        returnString = "uint8_t " + node.name + "="
+    elif node.type.Node_Type == "Type_Name":
+        returnString = node.type.path.name + " " + node.name + "="
+
+    if len(returnString) == 0:
+        return allocate(node)
+
+    return returnString + " " + toC(node.initializer) + ";"
 
 def Declaration_Instance(node):
     returnString = ""
     if node.name == "main":
         if package == "V1Switch":
-            parser = node.arguments.vec[0].type.path.name if hasattr(node.arguments.vec[0].type, "path") else node.arguments.vec[0].type.name
-            ingress = node.arguments.vec[2].type.path.name if hasattr(node.arguments.vec[2].type, "path") else node.arguments.vec[2].type.name
-            egress = node.arguments.vec[3].type.path.name if hasattr(node.arguments.vec[3].type, "path") else node.arguments.vec[3].type.name
-            deparser = node.arguments.vec[5].type.path.name if hasattr(node.arguments.vec[5].type, "path") else node.arguments.vec[5].type.name
+            parser = node.arguments.vec[0].expression.type.path.name if hasattr(node.arguments.vec[0].expression.type, "path") else node.arguments.vec[0].expression.type.name
+            ingress = node.arguments.vec[2].expression.type.path.name if hasattr(node.arguments.vec[2].expression.type, "path") else node.arguments.vec[2].expression.type.name
+            egress = node.arguments.vec[3].expression.type.path.name if hasattr(node.arguments.vec[3].expression.type, "path") else node.arguments.vec[3].expression.type.name
+            deparser = node.arguments.vec[5].expression.type.path.name if hasattr(node.arguments.vec[5].expression.type, "path") else node.arguments.vec[5].expression.type.name
             returnString += "int main() {\n\t" +  parser + "();\n\t" + ingress + "();\n\t" + egress + "();\n\t" + deparser +  "();\n\tend_assertions();\n\treturn 0;\n}\n"
         elif package == "VSS":
             parser = node.arguments.vec[0].type.path.name if hasattr(node.arguments.vec[0].type, "path") else node.arguments.vec[0].type.name
@@ -372,8 +409,8 @@ def Declaration_Instance(node):
             returnString += "int main() {\n\t" +  parser + "();\n\t" + ingress + "();\n\t" + deparser + "();\n\tend_assertions();\n\treturn 0;\n}\n"
     elif hasattr(node.type, "path"):
         declarationTypes[node.name] = node.type.path.name
-    return returnString        
-    
+    return returnString
+
 def Declaration_Variable(node):
     if node.type.Node_Type == "Type_Bits":
         return bitsSizeToType(node.type.size) + " " + node.name + ";"
@@ -394,7 +431,10 @@ def Equ(node):
     return "(" + toC(node.left) +  " == " + toC(node.right) + ")"
 
 def ExpressionValue(node):
-    return toC(node.expression) 
+    return toC(node.expression)
+
+def ExitStatement(node):
+    return ""
 
 def Grt(node):
     return greater(node)
@@ -432,7 +472,9 @@ def Member(node):
             return nodeName
 
 def Method(node):
-    if node.name == "mark_to_drop": #V1 specific
+    global hasMarkToDrop
+    if node.name == "mark_to_drop" and not hasMarkToDrop: #V1 specific
+        hasMarkToDrop = True
         return mark_to_drop()
     else:
         return toC(node.type)
@@ -532,7 +574,7 @@ def P4Action(node):
                 if param.type.Node_Type == "Type_Bits":
                     parameter = bitsSizeToType(param.type.size) + " " + param.name
                 else:
-                    parameter = toC(param.type) + " " + param.name 
+                    parameter = toC(param.type) + " " + param.name
                 parameters += parameter + ", "
             else:
                 if param.type.Node_Type == "Type_Bits":
@@ -647,7 +689,11 @@ def StructField(node):
     #future solution: discriminate by struct name
     if node.type.Node_Type == "Type_Name":
         structFieldsHeaderTypes[node.name] = node.type.path.name
-        returnString += "\t" + structFieldsHeaderTypes[node.name] + " " + node.name + ";"
+        if node.type.path.name == "error":
+            returnString += "\t" + "enum ParserError"
+        else:
+            returnString += "\t" + structFieldsHeaderTypes[node.name]
+        returnString += " " + node.name + ";"
     elif node.type.Node_Type == "Type_Stack":
         structFieldsHeaderTypes[node.name] = node.type.elementType.path.name
         headerStackSize[node.name] = node.type.size.value
@@ -731,7 +777,7 @@ def Type_Table(node):
 def Type_Typedef(node):
     typedef[node.name] = node
     return "typedef " + bitsSizeToType(node.type.size) + " " + node.name + ";\n"
-    
+
 def Type_Unknown(node):
     #return "<Type_Unknown>" + str(node.Node_ID)
     return ""
@@ -777,7 +823,7 @@ def P4Parser(node):
     returnString += "void " + node.name + "() {\n"
     returnString += SymbolizeParameters(node)
     returnString += "\tstart();\n}\n"
-    return returnString 
+    return returnString
 
 def Type_Enum(node):
     #return "<Type_Enum>" + str(node.Node_ID)
@@ -823,7 +869,8 @@ def actionListWithRules(node):
     elif currentTable[1:-2] in forwardingRules.keys():
         currentTable = currentTable[1:-2]
 
-    # this default action string will be informat of "<action>();" 
+    print "TABLE:" + currentTable
+    # this default action string will be informat of "<action>();"
     # as per function "Property", so we are removing the "();" part
     # TODO: this is probably not the best way to handle this situation
     defaultAction = getActionFullName(currentTableDefaultAction[:-3])
@@ -837,8 +884,9 @@ def actionListWithRules(node):
         for rule in forwardingRules[currentTable]:
             # adding entry to table
             if rule[0] == "table_add":
+                print rule
                 match = ""
-                
+
                 for idx in range(len(currentTableKeysOrdered)):
                     key = currentTableKeysOrdered[idx]
                     if currentTableKeys[key] == "exact":
@@ -888,7 +936,7 @@ def convertCommandValue(arg):
 def getActionFullName(actionName):
     # actionName = actionName + "_"
 
-    check_similarity = lambda a,b: SequenceMatcher(None, a, b).ratio() 
+    check_similarity = lambda a,b: SequenceMatcher(None, a, b).ratio()
 
     curr_action = "UNKNOWN_ACTION"
     similarity = 0.0
@@ -904,7 +952,7 @@ def getActionFullName(actionName):
                 if similarity > 0.9:
                     # print actionName, curr_action, similarity, 'early return'
                     return action + "_" + str(actionIDs[action])
-    
+
     # print actionName, curr_action, similarity
 
     if curr_action != "UNKNOWN_ACTION":
@@ -1027,7 +1075,7 @@ def extract(node):
         headerToExtract = headerToExtract[:-5]
         returnString += headerToExtract + "[" + headerToExtract + "_index]" + ".isValid = 1;\n\t"
         returnString += headerToExtract + "_index++;"
-    else: 
+    else:
         returnString += headerToExtract + ".isValid = 1;\n\t"
         returnString += "[POST]extract_header_" + headerToExtract.replace(".", "_") + " = 1;"
     return returnString
