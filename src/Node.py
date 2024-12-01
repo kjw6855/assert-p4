@@ -12,7 +12,7 @@ def NodeFactory(node):
 class Node(object):
 
     def __init__(self, node):
-        
+
         #if node already exists, reference it instead of self
         updateNode = self
         nodeId = node.get('Node_ID', None)
@@ -20,7 +20,7 @@ class Node(object):
             if nodeId not in allNodes:
                 allNodes[nodeId] = self
             updateNode = allNodes[nodeId]
-        
+
         #update node value for each attribute
         for k in node.keys():
             if isinstance(node[k], dict):

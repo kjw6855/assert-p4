@@ -3,7 +3,9 @@ import uuid
 from difflib import SequenceMatcher
 # from helper import eprint
 
+libfuzzerMode = False
 hasMarkToDrop = False
+verbose = False
 headers = []
 structFieldsHeaderTypes = {} #structField, structFieldType
 structs = {} # structName, listOfFields
@@ -34,6 +36,10 @@ emitHeadersAssertions = []
 extractHeadersAssertions = []
 parserErrors = ["NoError", "PacketTooShort", "NoMatch", "StackOutOfBounds", "HeaderTooShort",
              "ParserTimeout", "ParserInvalidArgument"]
+
+def verbose_print(*args, **kwargs):
+    global verbose
+    if verbose : print(*args, **kwargs)
 
 # cleanup global variables for run() reusability in the same program...
 def cleanup_variables():
@@ -76,13 +82,19 @@ def cleanup_variables():
     global assertionsCount
     assertionsCount = 0 #tracking id for klee_print_once
     global finalAssertions
-    finalAssertions = """void assert_error(int id, char msg[]) {
-    \tklee_print_once(id, msg);
-    \t//klee_abort();
-    }
+    global libfuzzerMode
 
-    void end_assertions() {
-    """
+    if libfuzzerMode:
+        finalAssertions = "void assert_error(int id, const char *msg) {\n"
+        finalAssertions += "\tcout << \"[ASSERT ERROR] \" << msg << endl;\n"
+        finalAssertions += "\texit(0);\n"
+    else:
+        finalAssertions = "void assert_error(int id, char msg[]) {\n"
+        finalAssertions +="\tklee_print_once(id, msg);\n"
+        finalAssertions +="\t//klee_abort();\n"
+
+    finalAssertions += "}\nvoid end_assertions() {"
+
     global emitHeadersAssertions
     emitHeadersAssertions = []
     global extractHeadersAssertions
@@ -119,12 +131,25 @@ def print_parser_error_enum():
     return returnString
 
 
-def run(node, rules):
+def run(node, rules, args):
+    global libfuzzerMode
+    libfuzzerMode = args.libfuzzerMode
+
     cleanup_variables()
     if rules != None:
         global forwardingRules
         forwardingRules = rules
-    returnString = "#define BITSLICE(x, a, b) ((x) >> (b)) & ((1 << ((a)-(b)+1)) - 1)\n#include<stdio.h>\n#include<stdint.h>\n#include<stdlib.h>\n\nint assert_forward = 1;\nint action_run;\n\nvoid end_assertions();\n\n"
+    returnString = "#define BITSLICE(x, a, b) ((x) >> (b)) & ((1 << ((a)-(b)+1)) - 1)\n"
+
+    if args.genCpp:
+        returnString += "#include <cstdio>\n#include <cstdint>\n#include <cstdlib>\n#include <csetjmp>\n#include <cstring>\n#include <stddef.h>\n\n"
+    else:
+        returnString += "#include <stdio.h>\n#include <stdint.h>\n#include <stdlib.h>\n\n"
+    returnString += "int assert_forward = 1;\nint action_run;\n\nvoid end_assertions();\n\n"
+
+    if libfuzzerMode:
+        returnString += "void set_variable(void *, size_t, const char*);\n"
+        returnString += "jmp_buf jmp_buf_var;\nsize_t offset;\nconst uint8_t *fuzz_data;\nsize_t fuzz_size;\n"
 
     returnString += print_parser_error_enum()
 
@@ -148,7 +173,7 @@ def toC(node):
             if nodeString != "":
                 returnString += nodeString + "\n"
     else:
-        print node.Node_Type, node.Node_ID
+        verbose_print(node.Node_Type, node.Node_ID)
 
         returnString += globals()[node.Node_Type](node) #calls corresponding type function according to node type
     return returnString
@@ -375,6 +400,10 @@ def BoolLiteral(node):
 def Constant(node):
     return str(node.value)
 
+def Concat(node):
+    # TODO: implement concat
+    return concat(node)
+
 def ConstructorCallExpression(node):
     #return "<ConstructorCallExpression>" + str(node.Node_ID)
     return ""
@@ -393,6 +422,19 @@ def Declaration_Constant(node):
 
     return returnString + " " + toC(node.initializer) + ";"
 
+def genMainDecl():
+    global libfuzzerMode
+    returnString = ""
+    if libfuzzerMode:
+        returnString = "extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+        returnString += "\tif (setjmp(jmp_buf_var)) {\n"
+        returnString += "\t\treturn 0;\n\t}\n"
+        returnString += "\tfuzz_data = data;\n\tfuzz_size = size;\n"
+    else:
+        returnString = "int main() {\n"
+
+    return returnString
+
 def Declaration_Instance(node):
     returnString = ""
     if node.name == "main":
@@ -401,12 +443,14 @@ def Declaration_Instance(node):
             ingress = node.arguments.vec[2].expression.type.path.name if hasattr(node.arguments.vec[2].expression.type, "path") else node.arguments.vec[2].expression.type.name
             egress = node.arguments.vec[3].expression.type.path.name if hasattr(node.arguments.vec[3].expression.type, "path") else node.arguments.vec[3].expression.type.name
             deparser = node.arguments.vec[5].expression.type.path.name if hasattr(node.arguments.vec[5].expression.type, "path") else node.arguments.vec[5].expression.type.name
-            returnString += "int main() {\n\t" +  parser + "();\n\t" + ingress + "();\n\t" + egress + "();\n\t" + deparser +  "();\n\tend_assertions();\n\treturn 0;\n}\n"
+            returnString += genMainDecl()
+            returnString += "\t" +  parser + "();\n\t" + ingress + "();\n\t" + egress + "();\n\t" + deparser +  "();\n\tend_assertions();\n\treturn 0;\n}\n"
         elif package == "VSS":
             parser = node.arguments.vec[0].type.path.name if hasattr(node.arguments.vec[0].type, "path") else node.arguments.vec[0].type.name
             ingress = node.arguments.vec[1].type.path.name if hasattr(node.arguments.vec[1].type, "path") else node.arguments.vec[1].type.name
             deparser = node.arguments.vec[2].type.path.name if hasattr(node.arguments.vec[2].type, "path") else node.arguments.vec[2].type.name
-            returnString += "int main() {\n\t" +  parser + "();\n\t" + ingress + "();\n\t" + deparser + "();\n\tend_assertions();\n\treturn 0;\n}\n"
+            returnString += genMainDecl()
+            returnString += "\t" +  parser + "();\n\t" + ingress + "();\n\t" + deparser + "();\n\tend_assertions();\n\treturn 0;\n}\n"
     elif hasattr(node.type, "path"):
         declarationTypes[node.name] = node.type.path.name
     return returnString
@@ -593,7 +637,7 @@ def P4Action(node):
     return "// Action\nvoid " + actionName + "(" + parameters + ") {\n\t" + actionData + toC(node.body) + "\n}\n\n"
 
 def P4Table(node):
-    #print "\nTable " + str(node.name)
+    #print("\nTable " + str(node.name))
     tableIDs[node.name] = node.Node_ID
     global currentTable
     currentTable = node.name
@@ -834,7 +878,15 @@ def Type_Parser(node):
     return ""
 
 def dropPacketCode():
-    return "assert_forward = 0;\n\tend_assertions();\n\texit(0);"
+    global libfuzzerMode
+    returnString = "assert_forward = 0;\n\tend_assertions();\n"
+
+    if libfuzzerMode:
+        returnString += "\tlongjmp(jmp_buf_var, 1);"
+    else:
+        returnString += "\texit(0);"
+
+    return returnString
 
 def ParserState(node):
     components = ""
@@ -869,7 +921,7 @@ def actionListWithRules(node):
     elif currentTable[1:-2] in forwardingRules.keys():
         currentTable = currentTable[1:-2]
 
-    print "TABLE:" + currentTable
+    print("TABLE:" + currentTable)
     # this default action string will be informat of "<action>();"
     # as per function "Property", so we are removing the "();" part
     # TODO: this is probably not the best way to handle this situation
@@ -884,7 +936,7 @@ def actionListWithRules(node):
         for rule in forwardingRules[currentTable]:
             # adding entry to table
             if rule[0] == "table_add":
-                print rule
+                print(rule)
                 match = ""
 
                 for idx in range(len(currentTableKeysOrdered)):
@@ -950,10 +1002,10 @@ def getActionFullName(actionName):
                 similarity = new_sim
 
                 if similarity > 0.9:
-                    # print actionName, curr_action, similarity, 'early return'
+                    # print(actionName, curr_action, similarity, 'early return')
                     return action + "_" + str(actionIDs[action])
 
-    # print actionName, curr_action, similarity
+    # print(actionName, curr_action, similarity)
 
     if curr_action != "UNKNOWN_ACTION":
         return curr_action + "_" + str(actionIDs[curr_action])
@@ -1023,6 +1075,9 @@ def allocate(node):
 
 def assign(node):
     return str(toC(node.left)) + " = " + str(toC(node.right)) + ";"
+
+def concat(node):
+    return formatATNode(node.left) + " ++ " + formatATNode(node.right)
 
 def formatATNode(node):
     value = ""
@@ -1098,14 +1153,17 @@ def bitsSizeToType(size):
     #    return "???"
 
 def klee_make_symbolic(var):
+    global libfuzzerMode
+    funcName = "set_variable" if libfuzzerMode else "klee_make_symbolic"
+
     returnString = ""
     if "." in var:
         symbolic_name = "t" + str(uuid.uuid4()).replace("-", "_")
         returnString += "\n\tuint64_t "+ symbolic_name + ";\n"
-        returnString += "\tklee_make_symbolic(&" + symbolic_name + ", sizeof(" + symbolic_name + "), \"" + symbolic_name + "\");\n\t"
+        returnString += "\t" + funcName + "(&" + symbolic_name + ", sizeof(" + symbolic_name + "), \"" + symbolic_name + "\");\n\t"
         returnString += var + " = " + symbolic_name + ";\n"
     else:
-        returnString += "\tklee_make_symbolic(&" + var + ", sizeof(" + var + "), \"" + var + "\");\n"
+        returnString += "\t" + funcName + "(&" + var + ", sizeof(" + var + "), \"" + var + "\");\n"
     return returnString
 
 # ---- V1 specific ----

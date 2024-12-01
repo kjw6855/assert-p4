@@ -31,7 +31,7 @@ def parse(file):
         elif command[0] == 'table_set_default':
             pass
         else:
-            print "Error: Unrecognized rule command"
+            print("Error: Unrecognized rule command")
 
         forwardingRules[command[1]].append(ruleComposition)
     return dict(forwardingRules)
